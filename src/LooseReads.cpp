@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <cwctype>
@@ -44,7 +45,7 @@ std::vector<std::string> g_extensions{ "dds" };
 using Counter = std::atomic<std::uint64_t>;
 Counter g_opens{ 0 }, g_cachedOpens{ 0 }, g_reads{ 0 }, g_readBytes{ 0 }, g_readTicks{ 0 }, g_longest{ 0 }, g_pieces{ 0 }, g_served{ 0 },
     g_diskReads{ 0 }, g_diskBytes{ 0 }, g_diskTicks{ 0 }, g_unused{ 0 }, g_passed{ 0 }, g_errors{ 0 }, g_verified{ 0 }, g_mismatches{ 0 },
-    g_untimed{ 0 };
+    g_untimed{ 0 }, g_otherReads{ 0 }, g_timedOut{ 0 };
 
 void Add(Counter& a_counter, std::uint64_t a_value) noexcept { a_counter.fetch_add(a_value, std::memory_order_relaxed); }
 
@@ -129,22 +130,26 @@ struct Pending
     std::uint64_t ticks;  // waited so far: inside ReadFile, then inside GetOverlappedResult
     bool piece;
     std::shared_ptr<Track> track;
+    bool onHandle;  // its OVERLAPPED has no event: whoever waits for it waits on the handle's own signal
 };
 
 std::mutex g_pendingMtx;
 std::unordered_map<LPOVERLAPPED, Pending> g_pending;
 std::atomic<std::size_t> g_pendingCount{ 0 };
 
-// Whether the game has a read in flight on this handle (or is about to wait for one). A read of ours on it would clear the
-// handle's own signal, which the game's GetOverlappedResult waits for when its OVERLAPPED has no event: the game's read
-// could then finish unseen and its thread wait for ever. So no whole-file read on such a handle.
+// Whether a read is in flight on this handle (or about to be) that will be waited for on the handle itself. A read of ours on
+// it would clear the handle's own signal, which GetOverlappedResult waits for when the OVERLAPPED has no event: that read could
+// then finish unseen and its thread wait for ever. So no whole-file read on such a handle. Reads with their own event (Creation
+// Engine Tweaks' parallel readers) are not at risk and do not hold whole-file reads back.
+// Not atomic with the whole-file read that follows: a read waiting on the handle that starts on another thread in between is not
+// seen. The game makes those reads from one streamer thread at a time per file (and Creation Engine Tweaks' readers use events).
 bool InFlight(HANDLE a_file) noexcept
 {
     if (!g_pendingCount.load(std::memory_order_relaxed))
         return false;
     std::lock_guard lk(g_pendingMtx);
     for (const auto& [overlapped, p] : g_pending)
-        if (p.file == a_file)
+        if (p.file == a_file && p.onHandle)
             return true;
     return false;
 }
@@ -163,9 +168,23 @@ void Finished(std::uint64_t a_bytes, std::uint64_t a_ticks, bool a_failed, bool 
         Add(g_pieces, 1);
 }
 
+// Set while this thread makes a read of our own: should a plugin chained before us call back into a patched import, that call
+// goes straight on (no tracking, no serving, no waiting for a slot this thread itself holds).
+thread_local bool t_ours = false;
+
+struct Ours
+{
+    bool was;
+    Ours() noexcept : was(t_ours) { t_ours = true; }
+    ~Ours() { t_ours = was; }
+    Ours(const Ours&) = delete;
+    Ours& operator=(const Ours&) = delete;
+};
+
 // One read from the game's handle, without the game's event or OVERLAPPED. Returns the bytes read.
 DWORD ReadAt(HANDLE a_file, void* a_to, std::uint64_t a_at, DWORD a_size, HANDLE a_event) noexcept
 {
+    const Ours ours;
     OVERLAPPED o{};
     o.Offset = static_cast<DWORD>(a_at);
     o.OffsetHigh = static_cast<DWORD>(a_at >> 32);
@@ -197,16 +216,30 @@ struct Pages
 // The last whole-file reads. Several, so that files read in turns do not take each other's away.
 struct Slot
 {
-    std::mutex mtx;
+    std::timed_mutex mtx;
     std::uint8_t* data{ nullptr };
     HANDLE event{ nullptr };
     std::uint64_t file{ 0 };  // Loose::id; 0 = empty
     std::uint64_t start{ 0 };
     std::uint64_t end{ 0 };
     std::uint64_t handed{ 0 };  // which pieces the game got, one bit each (64 pieces of 64 KB = 4 MB)
+    // What it holds or is reading in right now, readable without the lock. Set under the lock; may be seen half changed, so
+    // whatever it promises is checked again under the lock.
+    std::atomic<std::uint64_t> claimFile{ 0 };
+    std::atomic<std::uint64_t> claimStart{ 0 };
+    std::atomic<std::uint64_t> claimEnd{ 0 };
 };
 Slot g_slots[4];
 std::atomic<unsigned> g_nextSlot{ 0 };
+// Taken to decide on a new whole-file read, never while waiting for a slot: two threads asking for pieces of one file at the same
+// moment (Creation Engine Tweaks' parallel readers) start one read of it, not two.
+std::mutex g_claimMtx;
+
+bool Claims(const Slot& a_slot, std::uint64_t a_file, std::uint64_t a_at) noexcept
+{
+    return a_slot.claimFile.load(std::memory_order_acquire) == a_file && a_at >= a_slot.claimStart.load(std::memory_order_relaxed) &&
+           a_at < a_slot.claimEnd.load(std::memory_order_relaxed);
+}
 static_assert(kMaxRead / kPiece <= 64);
 
 // What a slot fetched that the game never asked for, before the slot is used again.
@@ -220,6 +253,7 @@ void Retire(Slot& a_slot) noexcept
             unused += (std::min)(kPiece, a_slot.end - at);
     Add(g_unused, unused);
     a_slot.file = 0;
+    a_slot.claimFile.store(0, std::memory_order_release);
 }
 
 BOOL Served(LPDWORD a_read, LPOVERLAPPED a_overlapped, DWORD a_bytes) noexcept
@@ -235,16 +269,33 @@ BOOL Served(LPDWORD a_read, LPOVERLAPPED a_overlapped, DWORD a_bytes) noexcept
     return TRUE;
 }
 
-// The piece at a_at, from a slot or from a new read of the rest of the file. False: the game's own read goes ahead.
-bool Serve(const Loose& a_file, HANDLE a_handle, void* a_to, std::uint64_t a_at, DWORD& a_bytes) noexcept
+// The longest wait for a whole-file read another thread is making. Longer than such a read takes even on a slow disk; should
+// that thread itself wait for this one (another plugin's worker threads chained in the imports), the caller reads its own piece.
+constexpr auto kSlotWait = std::chrono::milliseconds(250);
+
+enum class Got
 {
-    if (a_at % kPiece || a_at >= a_file.size) {
-        Add(g_passed, 1);  // at or past the end, the game's own read reports it
-        return false;
-    }
+    no,    // no slot has it
+    yes,   // copied
+    busy,  // a slot is reading it in, and did not finish in kSlotWait
+};
+
+// The piece at a_at from a slot that holds it; a slot still reading it in is waited for, up to kSlotWait.
+Got FromSlot(const Loose& a_file, std::uint64_t a_at, void* a_to, DWORD& a_bytes) noexcept
+{
     for (auto& slot : g_slots) {
-        std::unique_lock lk(slot.mtx, std::try_to_lock);
-        if (!lk || slot.file != a_file.id || a_at < slot.start || a_at >= slot.end)
+        if (!Claims(slot, a_file.id, a_at))
+            continue;
+        std::unique_lock lk(slot.mtx, std::defer_lock);
+        try {
+            if (!lk.try_lock_for(kSlotWait)) {
+                Add(g_timedOut, 1);
+                return Got::busy;
+            }
+        } catch (...) {
+            return Got::busy;
+        }
+        if (slot.file != a_file.id || a_at < slot.start || a_at >= slot.end)
             continue;
         const auto bytes = (std::min)(kPiece, slot.end - a_at);
         if (bytes < kPiece && slot.end < a_file.size)
@@ -252,7 +303,22 @@ bool Serve(const Loose& a_file, HANDLE a_handle, void* a_to, std::uint64_t a_at,
         std::memcpy(a_to, slot.data + (a_at - slot.start), bytes);
         slot.handed |= 1ull << ((a_at - slot.start) / kPiece);
         a_bytes = static_cast<DWORD>(bytes);
-        return true;
+        return Got::yes;
+    }
+    return Got::no;
+}
+
+// The piece at a_at, from a slot or from a new read of the rest of the file. False: the game's own read goes ahead.
+bool Serve(const Loose& a_file, HANDLE a_handle, void* a_to, std::uint64_t a_at, DWORD& a_bytes) noexcept
+{
+    if (a_at % kPiece || a_at >= a_file.size) {
+        Add(g_passed, 1);  // at or past the end, the game's own read reports it
+        return false;
+    }
+    if (const auto got = FromSlot(a_file, a_at, a_to, a_bytes); got != Got::no) {
+        if (got == Got::busy)
+            Add(g_passed, 1);
+        return got == Got::yes;
     }
     const auto left = a_file.size - a_at;
     if (left <= kPiece || InFlight(a_handle)) {
@@ -260,39 +326,64 @@ bool Serve(const Loose& a_file, HANDLE a_handle, void* a_to, std::uint64_t a_at,
         return false;
     }
     const auto want = static_cast<DWORD>((std::min)((left + kPiece - 1) / kPiece * kPiece, std::uint64_t{ g_maxRead.load(std::memory_order_relaxed) }));
-    const auto first = g_nextSlot.fetch_add(1, std::memory_order_relaxed);
-    for (unsigned i = 0; i < std::size(g_slots); ++i) {
-        auto& slot = g_slots[(first + i) % std::size(g_slots)];
-        std::unique_lock lk(slot.mtx, std::try_to_lock);
-        if (!lk)
-            continue;
-        Retire(slot);
-        if (!slot.data) {
-            // Page-aligned, as reads without the Windows cache need.
-            slot.data = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kMaxRead, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-            if (!slot.event)
-                slot.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!slot.data || !slot.event)
-                break;
+    Slot* mine = nullptr;
+    std::unique_lock<std::timed_mutex> lk;
+    bool claimed = false;  // by another thread since the look above
+    try {
+        std::lock_guard claim(g_claimMtx);
+        for (const auto& slot : g_slots)
+            claimed = claimed || Claims(slot, a_file.id, a_at);
+        const auto first = claimed ? 0 : g_nextSlot.fetch_add(1, std::memory_order_relaxed);
+        for (unsigned i = 0; !claimed && i < std::size(g_slots); ++i) {
+            auto& slot = g_slots[(first + i) % std::size(g_slots)];
+            std::unique_lock l(slot.mtx, std::try_to_lock);
+            if (!l)
+                continue;
+            Retire(slot);
+            if (!slot.data) {
+                // Page-aligned, as reads without the Windows cache need.
+                slot.data = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kMaxRead, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!slot.event)
+                    slot.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!slot.data || !slot.event)
+                    break;
+            }
+            slot.claimStart.store(a_at, std::memory_order_relaxed);
+            slot.claimEnd.store(a_at + want, std::memory_order_relaxed);
+            slot.claimFile.store(a_file.id, std::memory_order_release);
+            mine = &slot;
+            lk = std::move(l);
+            break;
         }
-        const auto t0 = Now();
-        const DWORD got = ReadAt(a_handle, slot.data, a_at, want, slot.event);
-        Add(g_diskTicks, static_cast<std::uint64_t>(Now() - t0));
-        if (got < (std::min)(kPiece, left))
-            break;  // the game's own read below meets the same problem and reports it
-        slot.file = a_file.id;
-        slot.start = a_at;
-        slot.end = a_at + got;
-        slot.handed = 1;
-        Add(g_diskReads, 1);
-        Add(g_diskBytes, got);
-        const auto bytes = (std::min)(kPiece, std::uint64_t{ got });
-        std::memcpy(a_to, slot.data, bytes);
-        a_bytes = static_cast<DWORD>(bytes);
-        return true;
+    } catch (...) {
+        mine = nullptr;  // a lock that could not be taken: the game's own read
     }
-    Add(g_passed, 1);
-    return false;
+    if (!mine) {
+        if (claimed && FromSlot(a_file, a_at, a_to, a_bytes) == Got::yes)
+            return true;
+        Add(g_passed, 1);
+        return false;
+    }
+    auto& slot = *mine;
+    const auto t0 = Now();
+    const DWORD got = ReadAt(a_handle, slot.data, a_at, want, slot.event);
+    Add(g_diskTicks, static_cast<std::uint64_t>(Now() - t0));
+    if (got < (std::min)(kPiece, left)) {
+        slot.claimFile.store(0, std::memory_order_release);
+        Add(g_passed, 1);
+        return false;  // the game's own read meets the same problem and reports it
+    }
+    slot.file = a_file.id;
+    slot.start = a_at;
+    slot.end = a_at + got;
+    slot.handed = 1;
+    slot.claimEnd.store(a_at + got, std::memory_order_relaxed);
+    Add(g_diskReads, 1);
+    Add(g_diskBytes, got);
+    const auto bytes = (std::min)(kPiece, std::uint64_t{ got });
+    std::memcpy(a_to, slot.data, bytes);
+    a_bytes = static_cast<DWORD>(bytes);
+    return true;
 }
 
 // bVerifyReads: the same piece read again the game's way. Never changes what the game got.
@@ -445,9 +536,10 @@ bool FromWindows(const std::string& a_module)
     return m == "kernel32.dll" || m == "kernelbase.dll" || m.starts_with("api-ms-win");
 }
 
-void FindImports()
+// The import slots of a_names in a_module (each left null when not imported).
+void FindSlots(HMODULE a_module, const char* const* a_names, ULONGLONG** a_slots, std::size_t a_count)
 {
-    auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    auto* base = reinterpret_cast<std::uint8_t*>(a_module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -458,22 +550,33 @@ void FindImports()
         auto* slot = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk);
         const auto* name = imp->OriginalFirstThunk ? reinterpret_cast<const IMAGE_THUNK_DATA*>(base + imp->OriginalFirstThunk) : nullptr;
         for (; slot->u1.Function; ++slot, name = name ? name + 1 : nullptr) {
-            for (auto& wanted : g_imports) {
-                if (wanted.slot)
+            for (std::size_t i = 0; i < a_count; ++i) {
+                if (a_slots[i])
                     continue;
                 bool same = false;
                 if (name && !IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal))
-                    same = std::strcmp(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name->u1.AddressOfData)->Name, wanted.name) == 0;
+                    same = std::strcmp(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name->u1.AddressOfData)->Name, a_names[i]) == 0;
                 else if (!name) {
                     // No names kept: recognised by address. Someone else's patch in this slot then goes unseen.
                     for (const auto module : modules)
-                        same = same || (module && reinterpret_cast<ULONGLONG>(GetProcAddress(module, wanted.name)) == slot->u1.Function);
+                        same = same || (module && reinterpret_cast<ULONGLONG>(GetProcAddress(module, a_names[i])) == slot->u1.Function);
                 }
                 if (same)
-                    wanted.slot = &slot->u1.Function;
+                    a_slots[i] = &slot->u1.Function;
             }
         }
     }
+}
+
+void FindImports()
+{
+    const char* names[std::size(g_imports)];
+    ULONGLONG* slots[std::size(g_imports)] = {};
+    for (std::size_t i = 0; i < std::size(g_imports); ++i)
+        names[i] = g_imports[i].name;
+    FindSlots(GetModuleHandleW(nullptr), names, slots, std::size(g_imports));
+    for (std::size_t i = 0; i < std::size(g_imports); ++i)
+        g_imports[i].slot = slots[i];
 }
 }  // namespace
 
@@ -545,21 +648,6 @@ std::vector<std::string> InstallReport()
     return out;
 }
 
-std::vector<std::string> Check()
-{
-    std::vector<std::string> out;
-    if (!g_installed)
-        return out;
-    for (const auto& i : g_imports) {
-        if (!i.slot)
-            continue;
-        const auto now = *reinterpret_cast<volatile ULONGLONG*>(i.slot);
-        if (now != reinterpret_cast<ULONGLONG>(i.hook))
-            out.push_back(std::format("{} now goes to {} first", i.name, ModuleOf(reinterpret_cast<const void*>(now))));
-    }
-    return out;
-}
-
 Stats GetStats(bool a_atExit)
 {
     Stats s;
@@ -581,6 +669,8 @@ Stats GetStats(bool a_atExit)
     s.verified = get(g_verified);
     s.mismatches = get(g_mismatches);
     s.untimed = get(g_untimed);
+    s.otherReads = get(g_otherReads);
+    s.timedOut = get(g_timedOut);
     {
         std::unique_lock lk(g_flagsMtx, std::defer_lock);
         if (a_atExit ? lk.try_lock() : (lk.lock(), true))
@@ -643,11 +733,16 @@ HANDLE WINAPI OnCreateFileW(LPCWSTR a_name, DWORD a_access, DWORD a_share, LPSEC
     return file;
 }
 
-BOOL WINAPI OnReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_read, LPOVERLAPPED a_overlapped)
+namespace
+{
+// Every patched ReadFile import comes here, each with the function its own slot held before.
+BOOL ReadImpl(ReadFileFn a_original, bool a_other, HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_read, LPOVERLAPPED a_overlapped)
 {
     Loose loose;
-    if (!Find(a_file, loose))
-        return g_readFile(a_file, a_buffer, a_size, a_read, a_overlapped);
+    if (t_ours || !Find(a_file, loose))
+        return a_original(a_file, a_buffer, a_size, a_read, a_overlapped);
+    if (a_other)
+        Add(g_otherReads, 1);
     const auto t0 = Now();
     if (loose.track)
         loose.track->Start(t0);
@@ -678,12 +773,12 @@ BOOL WINAPI OnReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_r
                 Add(g_untimed, g_pending.size());
                 g_pending.clear();
             }
-            g_pending[a_overlapped] = { a_file, 0, piece, loose.track };
+            g_pending[a_overlapped] = { a_file, 0, piece, loose.track, a_overlapped->hEvent == nullptr };
             g_pendingCount.store(g_pending.size(), std::memory_order_relaxed);
         } catch (...) {
         }
     }
-    const BOOL ok = g_readFile(a_file, a_buffer, a_size, a_read, a_overlapped);
+    const BOOL ok = a_original(a_file, a_buffer, a_size, a_read, a_overlapped);
     const DWORD error = GetLastError();
     const auto ticks = static_cast<std::uint64_t>(Now() - t0);
     if (!ok && error == ERROR_IO_PENDING && a_overlapped) {
@@ -692,7 +787,7 @@ BOOL WINAPI OnReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_r
             if (const auto it = g_pending.find(a_overlapped); it != g_pending.end())
                 it->second.ticks += ticks;
             else
-                g_pending[a_overlapped] = { a_file, ticks, piece, loose.track };
+                g_pending[a_overlapped] = { a_file, ticks, piece, loose.track, a_overlapped->hEvent == nullptr };
             g_pendingCount.store(g_pending.size(), std::memory_order_relaxed);
         } catch (...) {
         }
@@ -709,19 +804,19 @@ BOOL WINAPI OnReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_r
     return ok;
 }
 
-BOOL WINAPI OnGetOverlappedResult(HANDLE a_file, LPOVERLAPPED a_overlapped, LPDWORD a_read, BOOL a_wait)
+BOOL GorImpl(GetOverlappedResultFn a_original, HANDLE a_file, LPOVERLAPPED a_overlapped, LPDWORD a_read, BOOL a_wait)
 {
-    if (!a_overlapped || !g_pendingCount.load(std::memory_order_relaxed))
-        return g_getOverlappedResult(a_file, a_overlapped, a_read, a_wait);
+    if (t_ours || !a_overlapped || !g_pendingCount.load(std::memory_order_relaxed))
+        return a_original(a_file, a_overlapped, a_read, a_wait);
     bool mine = false;
     {
         std::lock_guard lk(g_pendingMtx);
         mine = g_pending.contains(a_overlapped);
     }
     if (!mine)
-        return g_getOverlappedResult(a_file, a_overlapped, a_read, a_wait);
+        return a_original(a_file, a_overlapped, a_read, a_wait);
     const auto t0 = Now();
-    const BOOL ok = g_getOverlappedResult(a_file, a_overlapped, a_read, a_wait);
+    const BOOL ok = a_original(a_file, a_overlapped, a_read, a_wait);
     const DWORD error = GetLastError();
     const auto ticks = static_cast<std::uint64_t>(Now() - t0);
     Pending done{};
@@ -742,6 +837,134 @@ BOOL WINAPI OnGetOverlappedResult(HANDLE a_file, LPOVERLAPPED a_overlapped, LPDW
         Finished(ok && a_read ? *a_read : 0, done.ticks, !ok && error != ERROR_HANDLE_EOF, done.piece, done.track.get());
     SetLastError(error);
     return ok;
+}
+
+// Another module's own imports of ReadFile and GetOverlappedResult (Creation Engine Tweaks reads the game's loose files on its own
+// threads through them). Each slot keeps the function it held before.
+struct Other
+{
+    HMODULE module{ nullptr };
+    std::string name;
+    ReadFileFn readFile{ nullptr };
+    GetOverlappedResultFn gor{ nullptr };
+    ULONGLONG* readSlot{ nullptr };
+    ULONGLONG* gorSlot{ nullptr };
+    std::string readBefore, gorBefore;
+};
+constexpr std::size_t kOthers = 4;
+Other g_others[kOthers];
+std::mutex g_othersMtx;
+
+template <std::size_t I>
+BOOL WINAPI OnReadFileOther(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_read, LPOVERLAPPED a_overlapped)
+{
+    return ReadImpl(g_others[I].readFile, true, a_file, a_buffer, a_size, a_read, a_overlapped);
+}
+
+template <std::size_t I>
+BOOL WINAPI OnGetOverlappedResultOther(HANDLE a_file, LPOVERLAPPED a_overlapped, LPDWORD a_read, BOOL a_wait)
+{
+    return GorImpl(g_others[I].gor, a_file, a_overlapped, a_read, a_wait);
+}
+
+constexpr ReadFileFn kOtherRead[kOthers] = { &OnReadFileOther<0>, &OnReadFileOther<1>, &OnReadFileOther<2>, &OnReadFileOther<3> };
+constexpr GetOverlappedResultFn kOtherGor[kOthers] = { &OnGetOverlappedResultOther<0>, &OnGetOverlappedResultOther<1>,
+    &OnGetOverlappedResultOther<2>, &OnGetOverlappedResultOther<3> };
+}  // namespace
+
+BOOL WINAPI OnReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_read, LPOVERLAPPED a_overlapped)
+{
+    return ReadImpl(g_readFile, false, a_file, a_buffer, a_size, a_read, a_overlapped);
+}
+
+BOOL WINAPI OnGetOverlappedResult(HANDLE a_file, LPOVERLAPPED a_overlapped, LPDWORD a_read, BOOL a_wait)
+{
+    return GorImpl(g_getOverlappedResult, a_file, a_overlapped, a_read, a_wait);
+}
+
+std::string HookModuleReads(HMODULE a_module)
+{
+    if (!g_installed)
+        return "the game's own imports are not patched";
+    if (!a_module || a_module == GetModuleHandleW(nullptr))
+        return "not another module";
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&HookModuleReads), &self);
+    if (a_module == self)
+        return "not another module";
+    std::lock_guard lk(g_othersMtx);
+    std::size_t index = kOthers;
+    for (std::size_t i = 0; i < kOthers; ++i) {
+        if (g_others[i].module == a_module)
+            return {};  // already done
+        if (!g_others[i].module && index == kOthers)
+            index = i;
+    }
+    if (index == kOthers)
+        return "no free hook left";
+    const char* names[2] = { "GetOverlappedResult", "ReadFile" };
+    ULONGLONG* slots[2] = { nullptr, nullptr };
+    FindSlots(a_module, names, slots, 2);
+    if (!slots[1])
+        return "it does not import ReadFile";
+    auto& o = g_others[index];
+    o.name = ModuleOf(reinterpret_cast<const void*>(a_module));
+    o.gorSlot = slots[0];
+    o.readSlot = slots[1];
+    // The originals first: the first call can come as soon as a slot changes.
+    o.gor = o.gorSlot ? reinterpret_cast<GetOverlappedResultFn>(*o.gorSlot) : g_getOverlappedResult;
+    o.readFile = reinterpret_cast<ReadFileFn>(*o.readSlot);
+    o.gorBefore = o.gorSlot ? ModuleOf(reinterpret_cast<const void*>(*o.gorSlot)) : std::string();
+    o.readBefore = ModuleOf(reinterpret_cast<const void*>(*o.readSlot));
+    // Completion first, then the reads: a read is never tracked whose completion would go unseen.
+    if (o.gorSlot && !WriteSlot(o.gorSlot, reinterpret_cast<ULONGLONG>(kOtherGor[index])))
+        return "its import of GetOverlappedResult could not be changed";
+    if (!WriteSlot(o.readSlot, reinterpret_cast<ULONGLONG>(kOtherRead[index]))) {
+        if (o.gorSlot)
+            WriteSlot(o.gorSlot, reinterpret_cast<ULONGLONG>(o.gor));
+        return "its import of ReadFile could not be changed";
+    }
+    o.module = a_module;
+    return {};
+}
+
+std::vector<std::string> Check()
+{
+    std::vector<std::string> out;
+    if (!g_installed)
+        return out;
+    for (const auto& i : g_imports) {
+        if (!i.slot)
+            continue;
+        const auto now = *reinterpret_cast<volatile ULONGLONG*>(i.slot);
+        if (now != reinterpret_cast<ULONGLONG>(i.hook))
+            out.push_back(std::format("{} now goes to {} first", i.name, ModuleOf(reinterpret_cast<const void*>(now))));
+    }
+    std::lock_guard lk(g_othersMtx);
+    for (std::size_t i = 0; i < kOthers; ++i) {
+        const auto& o = g_others[i];
+        if (!o.module)
+            continue;
+        if (const auto now = *reinterpret_cast<volatile ULONGLONG*>(o.readSlot); now != reinterpret_cast<ULONGLONG>(kOtherRead[i]))
+            out.push_back(std::format("{}'s ReadFile now goes to {} first", o.name, ModuleOf(reinterpret_cast<const void*>(now))));
+        if (o.gorSlot)
+            if (const auto now = *reinterpret_cast<volatile ULONGLONG*>(o.gorSlot); now != reinterpret_cast<ULONGLONG>(kOtherGor[i]))
+                out.push_back(std::format("{}'s GetOverlappedResult now goes to {} first", o.name, ModuleOf(reinterpret_cast<const void*>(now))));
+    }
+    return out;
+}
+
+std::vector<std::string> OtherModulesReport()
+{
+    std::vector<std::string> out;
+    std::lock_guard lk(g_othersMtx);
+    for (const auto& o : g_others) {
+        if (!o.module)
+            continue;
+        out.push_back(std::format("{}: ReadFile patched ({} {}), GetOverlappedResult {}", o.name, FromWindows(o.readBefore) ? "was" : "chained after",
+            o.readBefore, !o.gorSlot ? "not imported" : FromWindows(o.gorBefore) ? "patched (was " + o.gorBefore + ")" : "patched, chained after " + o.gorBefore));
+    }
+    return out;
 }
 
 BOOL WINAPI OnCloseHandle(HANDLE a_handle)

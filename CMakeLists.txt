@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.23)
 
 set(NAME "FasterLooseFiles")
-set(VERSION 1.0.0)
+set(VERSION 1.0.1)
 
 project(${NAME} VERSION ${VERSION} LANGUAGES CXX)
 
@@ -75,6 +75,10 @@ enable_testing()
 add_executable(LooseReadsTest "${CMAKE_CURRENT_SOURCE_DIR}/tests/LooseReadsTest.cpp")
 target_compile_options(LooseReadsTest PRIVATE ${COMMON_OPTIONS})
 target_link_libraries(LooseReadsTest PRIVATE LooseReadsCore)
+# Another plugin's reads through its own imports, as Creation Engine Tweaks makes them; next to the test.
+add_library(OtherReader SHARED "${CMAKE_CURRENT_SOURCE_DIR}/tests/OtherReader.cpp")
+target_compile_options(OtherReader PRIVATE ${COMMON_OPTIONS})
+add_dependencies(LooseReadsTest OtherReader)
 # Optionally also replays recorded game reads: -DLOOSE_READS_TRACES="trace1.txt;trace2.txt".
 set(LOOSE_READS_TRACES "" CACHE STRING "Recorded loose file reads of the game, replayed by the test")
 add_test(NAME loose-reads COMMAND LooseReadsTest ${LOOSE_READS_TRACES})

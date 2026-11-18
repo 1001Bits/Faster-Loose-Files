@@ -10,7 +10,9 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -315,11 +317,41 @@ void TestTrace(const fs::path& a_trace)
 using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 ReadFileFn g_otherOriginal = nullptr;
 int g_otherCalls = 0;
+// When set: reads larger than a piece (our whole-file reads) are split into pieces and made again through another module's
+// import that this plugin patched, as a plugin handing reads to its own workers would. Our hooks must let them straight through.
+using RawReadFn = BOOL (*)(HANDLE, void*, DWORD, DWORD*, OVERLAPPED*);
+using RawWaitFn = BOOL (*)(HANDLE, OVERLAPPED*, DWORD*);
+RawReadFn g_reenterRead = nullptr;
+RawWaitFn g_reenterWait = nullptr;
+int g_reentered = 0;
 
 BOOL WINAPI OtherReadFile(HANDLE a_file, LPVOID a_buffer, DWORD a_size, LPDWORD a_read, LPOVERLAPPED a_overlapped)
 {
     ++g_otherCalls;
-    return g_otherOriginal(a_file, a_buffer, a_size, a_read, a_overlapped);
+    if (!g_reenterRead || a_size <= kPiece || !a_overlapped || !a_read)
+        return g_otherOriginal(a_file, a_buffer, a_size, a_read, a_overlapped);
+    const std::uint64_t at = (static_cast<std::uint64_t>(a_overlapped->OffsetHigh) << 32) | a_overlapped->Offset;
+    const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DWORD total = 0;
+    for (DWORD off = 0; off < a_size; off += kPiece) {
+        OVERLAPPED o{};
+        o.Offset = static_cast<DWORD>(at + off);
+        o.OffsetHigh = static_cast<DWORD>((at + off) >> 32);
+        o.hEvent = event;
+        DWORD n = 0;
+        ++g_reentered;
+        if (!g_reenterRead(a_file, static_cast<std::uint8_t*>(a_buffer) + off, kPiece, &n, &o) &&
+            !(GetLastError() == ERROR_IO_PENDING && g_reenterWait(a_file, &o, &n)))
+            n = 0;
+        total += n;
+        if (n < kPiece)
+            break;
+    }
+    CloseHandle(event);
+    a_overlapped->Internal = 0;
+    a_overlapped->InternalHigh = total;
+    *a_read = total;
+    return total > 0;
 }
 
 ULONGLONG* OwnSlot(const char* a_name)
@@ -468,6 +500,181 @@ void TestInstall(const fs::path& a_dir)
     ::CloseHandle(plain);
     CHECK(g_otherCalls == calls + 1, "an untracked read reaches the other patch");
 }
+// Another plugin reading tracked files through its own imports, as Creation Engine Tweaks' parallel streamer readers do. After
+// TestInstall: the game's imports are patched.
+void TestOtherModule(const fs::path& a_dir)
+{
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const HMODULE module = LoadLibraryW((fs::path(exe).parent_path() / L"OtherReader.dll").c_str());
+    CHECK(module != nullptr, "OtherReader.dll next to the test");
+    if (!module)
+        return;
+    using ReadAtFn = long long (*)(HANDLE, void*, DWORD, std::uint64_t);
+    const auto otherReadAt = reinterpret_cast<ReadAtFn>(GetProcAddress(module, "OtherReadAt"));
+    CHECK(otherReadAt != nullptr, "OtherReadAt exported");
+    if (!otherReadAt)
+        return;
+    const auto path = a_dir / "t4194307.dds";
+    const auto content = Content(4194304 + 3);
+    Aligned buffer(kPiece);
+    const auto readAll = [&](bool a_cache, bool a_verify = false) {
+        Configure(Mode(true, a_cache, a_verify));
+        HANDLE h = ::CreateFileA(path.string().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, kGameAsync, nullptr);
+        int bad = 0;
+        for (std::uint64_t at = 0; at < content.size(); at += kPiece) {
+            const auto want = (std::min)(std::uint64_t{ kPiece }, content.size() - at);
+            const long long got = otherReadAt(h, buffer.p, kPiece, at);
+            bad += got != static_cast<long long>(want) || std::memcmp(buffer.p, content.data() + at, want) != 0;
+        }
+        ::CloseHandle(h);
+        return bad;
+    };
+
+    // Before: unseen, as with Creation Engine Tweaks 20 and Faster Loose Files 1.0.0.
+    auto before = GetStats();
+    CHECK(readAll(true) == 0, "the other module's reads, unpatched");
+    auto after = GetStats();
+    CHECK(after.opens - before.opens == 1 && after.reads == before.reads && after.served == before.served && after.otherReads == 0, "unpatched: reads %llu served %llu",
+        after.reads - before.reads, after.served - before.served);
+
+    const auto problem = HookModuleReads(module);
+    CHECK(problem.empty(), "hook the other module: %s", problem.c_str());
+    CHECK(HookModuleReads(module).empty() && OtherModulesReport().size() == 1, "a second call changes nothing");
+    CHECK(!HookModuleReads(GetModuleHandleW(nullptr)).empty(), "the game itself is not another module");
+    for (const auto& line : OtherModulesReport())
+        std::printf("  import of %s\n", line.c_str());
+    CHECK(Check().empty(), "nothing took the imports");
+
+    // One thread, cached and unbuffered (pending reads, completed through the other module's GetOverlappedResult).
+    for (const bool cache : { true, false }) {
+        before = GetStats();
+        CHECK(readAll(cache) == 0, "the other module's reads, patched, cache %d", cache);
+        after = GetStats();
+        CHECK(after.reads - before.reads == 65 && after.served - before.served == 64 && after.untimed == before.untimed &&
+                  after.errors == before.errors && after.otherReads - before.otherReads == 65,
+            "patched, cache %d: reads %llu served %llu untimed %llu", cache, after.reads - before.reads, after.served - before.served,
+            after.untimed - before.untimed);
+    }
+
+    // Verify through the other module.
+    before = GetStats();
+    CHECK(readAll(true, true) == 0, "the other module's reads, verified");
+    after = GetStats();
+    CHECK(after.verified - before.verified == 64 && after.mismatches == 0, "verify through the other module: %llu verified, %llu mismatches",
+        after.verified - before.verified, after.mismatches);
+
+    const auto otherRaw = reinterpret_cast<RawReadFn>(GetProcAddress(module, "OtherReadRaw"));
+    const auto otherWait = reinterpret_cast<RawWaitFn>(GetProcAddress(module, "OtherWait"));
+    CHECK(otherRaw && otherWait, "OtherReadRaw and OtherWait exported");
+    if (!otherRaw || !otherWait)
+        return;
+    const auto bigPath = a_dir / "t9449529.dds";
+    const auto big = Content(9 * 1048576 + 12345);
+
+    // What a served piece leaves for a caller with its own event: as Windows after a read that finished at once. Then a read that
+    // goes to Windows with the same event, left signalled, still waits for its own completion.
+    {
+        Configure(Mode(true, false));
+        HANDLE h = ::CreateFileA(bigPath.string().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, kGameAsync, nullptr);
+        CHECK(otherReadAt(h, buffer.p, kPiece, 0) == kPiece, "first piece");
+        const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        OVERLAPPED o{};
+        o.Offset = kPiece;
+        o.hEvent = event;
+        o.Internal = 0xDEAD;
+        DWORD n = 0;
+        const auto served = GetStats().served;
+        const BOOL ok = otherRaw(h, buffer.p, kPiece, &n, &o);
+        CHECK(ok && n == kPiece && GetStats().served == served + 1 && o.Internal == 0 && o.InternalHigh == kPiece &&
+                  WaitForSingleObject(event, 0) == WAIT_OBJECT_0 && std::memcmp(buffer.p, big.data() + kPiece, kPiece) == 0,
+            "a served piece's OVERLAPPED and event");
+        // 4 MB on, not one piece: the game's way, pending on an unbuffered handle.
+        Aligned large(16 * kPiece);
+        OVERLAPPED o2{};
+        o2.Offset = 4 * 1048576;
+        o2.hEvent = event;
+        n = 0;
+        BOOL ok2 = otherRaw(h, large.p, 16 * kPiece, &n, &o2);
+        if (!ok2 && GetLastError() == ERROR_IO_PENDING)
+            ok2 = otherWait(h, &o2, &n);
+        CHECK(ok2 && n == 16 * kPiece && std::memcmp(large.p, big.data() + 4 * 1048576, n) == 0, "a later read with the same event");
+        CloseHandle(event);
+
+        // The game's own read waiting on the handle (no event) while the other module's readers ask for pieces of the same file: no
+        // whole-file read on that handle meanwhile, their pieces come the normal way, and the game's read completes.
+        OVERLAPPED g{};
+        g.Offset = 6 * 1048576;
+        DWORD gn = 0;
+        const BOOL gok = OnReadFile(h, large.p, 16 * kPiece, &gn, &g);
+        const bool pending = !gok && GetLastError() == ERROR_IO_PENDING;
+        const auto mid = GetStats();
+        Aligned piece(kPiece);
+        CHECK(otherReadAt(h, piece.p, kPiece, 8 * 1048576) == kPiece && std::memcmp(piece.p, big.data() + 8 * 1048576, kPiece) == 0,
+            "a piece while the game waits on the handle");
+        if (pending) {
+            CHECK(GetStats().diskReads == mid.diskReads, "no whole-file read while the game waits on the handle");
+            OnGetOverlappedResult(h, &g, &gn, TRUE);
+        }
+        CHECK(gn == 16 * kPiece && std::memcmp(large.p, big.data() + 6 * 1048576, gn) == 0, "the game's read, completed");
+        ::CloseHandle(h);
+        std::printf("other module, game read on the handle %s pending\n", pending ? "was" : "was not (check skipped)");
+    }
+
+    // Sixteen threads taking the pieces of one file in turn, as Creation Engine Tweaks' readers do: every byte right, the pieces
+    // served, and the file fetched about once, not once per thread.
+    for (const bool cache : { true, false }) {
+        Configure(Mode(true, cache));
+        before = GetStats();
+        HANDLE h = ::CreateFileA(bigPath.string().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, kGameAsync, nullptr);
+        std::atomic<std::uint64_t> next{ 0 };
+        std::atomic<int> bad{ 0 };
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 16; ++t) {
+            readers.emplace_back([&] {
+                Aligned piece(kPiece);
+                for (std::uint64_t at; (at = next.fetch_add(kPiece)) < big.size();) {
+                    const auto want = (std::min)(std::uint64_t{ kPiece }, big.size() - at);
+                    const long long got = otherReadAt(h, piece.p, kPiece, at);
+                    if (got != static_cast<long long>(want) || std::memcmp(piece.p, big.data() + at, want) != 0)
+                        ++bad;
+                }
+            });
+        }
+        for (auto& r : readers)
+            r.join();
+        ::CloseHandle(h);
+        after = GetStats();
+        const auto fetched = after.diskBytes - before.diskBytes;
+        CHECK(bad == 0, "parallel, cache %d: %d pieces wrong", cache, bad.load());
+        CHECK(after.errors == before.errors && after.untimed == before.untimed, "parallel, cache %d: errors or untimed reads", cache);
+        CHECK(fetched <= big.size() * 2, "parallel, cache %d: %llu bytes fetched for a %zu byte file", cache, fetched, big.size());
+        CHECK(after.served - before.served + 1 >= after.pieces - before.pieces && after.diskReads - before.diskReads <= 12 &&
+                  after.timedOut == before.timedOut,
+            "parallel, cache %d: %llu of %llu pieces served in %llu reads, %llu waits timed out", cache, after.served - before.served,
+            after.pieces - before.pieces, after.diskReads - before.diskReads, after.timedOut - before.timedOut);
+        std::printf("parallel readers, cache %d: %llu of %llu pieces served, %.2fx the file fetched in %llu reads\n", cache,
+            after.served - before.served, after.pieces - before.pieces, static_cast<double>(fetched) / static_cast<double>(big.size()),
+            after.diskReads - before.diskReads);
+    }
+
+    // A plugin chained before us in the game's ReadFile import makes our whole-file reads again, piece by piece, through another
+    // module's import we patched: those reads go straight to Windows, nothing waits on the slot this thread holds.
+    g_reenterRead = otherRaw;
+    g_reenterWait = otherWait;
+    g_reentered = 0;
+    before = GetStats();
+    const auto t0 = GetTickCount64();
+    CHECK(readAll(true) == 0, "re-entered whole-file reads");
+    const auto ms = GetTickCount64() - t0;
+    after = GetStats();
+    g_reenterRead = nullptr;
+    g_reenterWait = nullptr;
+    CHECK(g_reentered >= 60 && after.served - before.served == 64 && after.timedOut == before.timedOut &&
+              after.otherReads - before.otherReads == 65 && ms < 2000,
+        "re-entry: %d pieces made again, %llu served, %llu waits timed out, %llu other reads, %llu ms", g_reentered,
+        after.served - before.served, after.timedOut - before.timedOut, after.otherReads - before.otherReads, ms);
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -483,6 +690,7 @@ int main(int argc, char** argv)
     TestInFlight(dir);
     TestFileTimes(dir);
     TestInstall(dir);
+    TestOtherModule(dir);
     std::error_code ec;
     fs::remove_all(dir, ec);
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);

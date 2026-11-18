@@ -48,10 +48,11 @@ double Mb(std::uint64_t a_bytes) { return static_cast<double>(a_bytes) / 1048576
 std::string Totals(const LooseReads::Stats& a_s)
 {
     return std::format("opens={} cached={} reads={} readMB={:.1f} waitMs={:.1f} longestMs={:.2f} pieces={} served={} diskReads={} "
-                       "diskMB={:.1f} diskMs={:.1f} unusedMB={:.1f} passed={} errors={} untimed={} verified={} mismatches={}",
+                       "diskMB={:.1f} diskMs={:.1f} unusedMB={:.1f} passed={} errors={} untimed={} verified={} mismatches={} viaPlugins={} waitTimeouts={}",
         a_s.opens, a_s.cachedOpens, a_s.reads, Mb(a_s.readBytes), LooseReads::TicksToMs(a_s.readTicks),
         LooseReads::TicksToMs(a_s.longestTicks), a_s.pieces, a_s.served, a_s.diskReads, Mb(a_s.diskBytes),
-        LooseReads::TicksToMs(a_s.diskTicks), Mb(a_s.unusedBytes), a_s.passed, a_s.errors, a_s.untimed, a_s.verified, a_s.mismatches);
+        LooseReads::TicksToMs(a_s.diskTicks), Mb(a_s.unusedBytes), a_s.passed, a_s.errors, a_s.untimed, a_s.verified, a_s.mismatches,
+        a_s.otherReads, a_s.timedOut);
 }
 
 std::string Summary(const char* a_when, bool a_atExit = false)
@@ -81,10 +82,27 @@ void LogNeighbours()
     for (const auto& k : { Known{ L"FasterArchives.dll", "Faster Archives found: it patches the same imports for .ba2 files; both chain" },
              Known{ L"Addictol.dll", "Addictol found: its IO Cacher may already open loose files with the Windows cache (see the flags)" },
              Known{ L"FasterStartup.dll", "Faster Startups found: it caches folder listings at startup; it does not read files" },
+             Known{ L"cetweaks.dll", "Creation Engine Tweaks found: its streamer threads read loose files through its own imports, patched too" },
              Known{ L"usvfs_x64.dll", "Mod Organizer's virtual file system found: loose files are opened through it" } }) {
         if (GetModuleHandleW(k.dll))
             Log::Info("{}", k.note);
     }
+}
+
+// Plugins that read the game's loose files on their own threads through their own imports.
+void HookOtherReaders(const char* a_when)
+{
+    static std::size_t reported = 0;
+    for (const auto* dll : { L"cetweaks.dll" }) {
+        const auto module = GetModuleHandleW(dll);
+        if (!module)
+            continue;
+        if (const auto problem = LooseReads::HookModuleReads(module); !problem.empty())
+            Log::Warn("Creation Engine Tweaks found ({}), its reads of loose files go on unchanged: {}", a_when, problem);
+    }
+    const auto lines = LooseReads::OtherModulesReport();
+    for (; reported < lines.size(); ++reported)
+        Log::Info("import of {}", lines[reported]);
 }
 
 void CheckImports(const char* a_when)
@@ -160,6 +178,7 @@ void MessageHandler(F4se::Message* a_message)
     switch (a_message->type) {
     case F4se::MessagingInterface::kPostLoad:
         LogNeighbours();
+        HookOtherReaders("after plugins loaded");
         CheckImports("after plugins loaded");
         break;
     case F4se::MessagingInterface::kPostPostLoad:
@@ -244,6 +263,7 @@ extern "C" __declspec(dllexport) bool F4SEPlugin_Load(const F4se::Interface* a_f
     }
     for (const auto& line : LooseReads::InstallReport())
         Log::Info("import {}", line);
+    HookOtherReaders("at load");
     Log::Info("{}", Settings::bWholeFileReads || Settings::bWindowsFileCache
                         ? std::format("loose files: whole-file reads {}, Windows file cache {}", Settings::bWholeFileReads ? "on" : "off",
                               Settings::bWindowsFileCache ? "on" : "off")

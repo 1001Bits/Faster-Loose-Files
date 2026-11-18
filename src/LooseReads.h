@@ -14,7 +14,10 @@
 // Everything works on the game executable's imports of CreateFileA/W, ReadFile,
 // GetOverlappedResult and CloseHandle. Only files with a listed extension opened for reading are
 // touched, and only reads of one aligned 64 KB piece with an OVERLAPPED; any other call, and
-// anything unexpected, goes on unchanged. Other plugins' own file access is never seen.
+// anything unexpected, goes on unchanged. Other plugins' own file access is never seen, except where
+// HookModuleReads is asked for: Creation Engine Tweaks reads the game's loose files on its own
+// threads (parallel streamer reads), with a per-thread event, through its own imports. Several of
+// those threads can ask for pieces of one file at the same moment: one whole-file read serves them.
 // The counters run in every mode, so "off" measures the game's own reads.
 // Game-independent: the tests run the same code.
 
@@ -66,6 +69,8 @@ struct Stats
     std::uint64_t verified{ 0 };      // pieces compared (bVerifyReads)
     std::uint64_t mismatches{ 0 };    // ... that differed: must stay 0
     std::uint64_t untimed{ 0 };       // reads that were pending and never seen to finish
+    std::uint64_t otherReads{ 0 };    // reads of listed files made through another plugin's imports (HookModuleReads)
+    std::uint64_t timedOut{ 0 };      // waits for another thread's whole-file read given up after 250 ms (the piece read normally)
     std::vector<FlagCount> openFlags;  // the flags the game asked for, by value
 };
 
@@ -97,6 +102,13 @@ void SetFileSink(FileSink a_sink);
 
 // Empty while every patched import still leads to this plugin first; else which one another module took.
 [[nodiscard]] std::vector<std::string> Check();
+
+// Another plugin that reads the game's loose files on its own threads through its own imports (Creation Engine Tweaks' parallel
+// streamer reads): its ReadFile and GetOverlappedResult imports are patched too, chained, so those reads are served the same way.
+// After Install. Empty on success or when that module was done already, else why nothing was changed. Up to four modules.
+[[nodiscard]] std::string HookModuleReads(HMODULE a_module);
+// One line per module patched by HookModuleReads.
+[[nodiscard]] std::vector<std::string> OtherModulesReport();
 
 // a_atExit: never waits for a lock (another thread may have been stopped holding it); the flags may then be missing.
 [[nodiscard]] Stats GetStats(bool a_atExit = false);
